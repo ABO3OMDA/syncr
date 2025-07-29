@@ -59,14 +59,17 @@ class ProductHelper:
             return {"has_tax": False, "tax_rate": 0, "tax_amount": 0}
 
     def get_odoo_image_url(self, product_id, image_type='main'):
-        """Generate Odoo public image URL - no downloading needed"""
+        """Generate Odoo public image URL - with correct naming convention"""
         try:
             if image_type == 'main':
-                # Main product image
+                # Main product cover image uses image_1920
                 image_url = f"https://odoo.eboutiques.com/public/product_image/{product_id}/image_1920"
-            else:
-                # Gallery images (image_1, image_2, etc.)
+            elif image_type.startswith('image_'):
+                # Gallery images use image_1, image_2, etc.
                 image_url = f"https://odoo.eboutiques.com/public/product_image/{product_id}/{image_type}"
+            else:
+                # For numbered gallery images
+                image_url = f"https://odoo.eboutiques.com/public/product_image/{product_id}/image_{image_type}"
             
             print(f"🔗 Generated Odoo image URL: {image_url}")
             return image_url
@@ -76,63 +79,81 @@ class ProductHelper:
             return "no_product_image.jpg"
 
     def sync_product_gallery(self, product_template_id, laravel_product_id):
-        """Sync product gallery URLs from Odoo to Laravel product_galleries table"""
+        """Sync product gallery URLs from Odoo to Laravel - Fixed with correct image naming"""
         try:
             print(f"🖼️  Syncing gallery for product {product_template_id}")
             
             # Clear existing gallery for this product (from sync)
             self.sql_connector.delete(
                 "product_galleries", 
-                f"`product_id` = '{laravel_product_id}' AND (`image` LIKE 'https://odoo.eboutiques.com/%' OR `image` LIKE 'storage/products/%')"
+                f"`product_id` = '{laravel_product_id}' AND `image` LIKE '%odoo.eboutiques.com%'"
             )
             
             synced_count = 0
             
-            # Check for gallery images (image_1 to image_10)
-            for i in range(1, 11):
-                try:
-                    image_url = f"https://odoo.eboutiques.com/public/product_image/{product_template_id}/image_{i}"
-                    
-                    print(f"  🔍 Checking: {image_url}")
-                    
-                    # Quick check if image exists
-                    import requests
-                    response = requests.head(image_url, timeout=5)
-                    
-                    print(f"    Response: {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        print(f"  ✅ Found gallery image: image_{i}")
-                        
-                        # Insert Odoo URL directly into product_galleries table
-                        gallery_data = {
-                            "product_id": laravel_product_id,
-                            "image": image_url,  # Store Odoo URL directly
-                            "status": 1,
-                            "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        }
-                        
-                        result = self.sql_connector.insert("product_galleries", gallery_data).fetch()
-                        if result:
-                            synced_count += 1
-                            print(f"  ✅ Gallery image {i} added: {image_url}")
-                        else:
-                            print(f"  ❌ Failed to insert gallery image {i}")
-                    elif response.status_code == 404:
-                        print(f"    ❌ Image {i} not found (404)")
-                    else:
-                        print(f"    ⚠️  Image {i} returned status: {response.status_code}")
-                    
-                except Exception as e:
-                    print(f"    ❌ Error checking image_{i}: {str(e)}")
-                    pass
+            # First, ensure main image is updated with image_1920
+            main_image_url = f"https://odoo.eboutiques.com/public/product_image/{product_template_id}/image_1920"
+            print(f"\n  🖼️  Updating main cover image: {main_image_url}")
             
-            print(f"🎉 Synced {synced_count} gallery images for product {product_template_id}")
+            self.sql_connector.update(
+                "products",
+                f"`id` = '{laravel_product_id}'",
+                {"thumb_image": main_image_url}
+            )
+            print(f"  ✅ Main cover image updated")
+            
+            # Now sync gallery images (image_1, image_2, etc.)
+            # These are separate from the main image_1920
+            print(f"\n  📸 Syncing gallery images...")
+            
+            for i in range(1, 11):  # Check up to 10 gallery images
+                # Gallery images use image_1, image_2, etc. (NOT image_1920)
+                gallery_image_url = f"https://odoo.eboutiques.com/public/product_image/{product_template_id}/image_{i}"
+                
+                print(f"  🔍 Adding gallery image_{i}")
+                
+                # Insert URL directly - Laravel ImageHelper handles validation
+                gallery_data = {
+                    "product_id": laravel_product_id,
+                    "image": gallery_image_url,
+                    "status": 1,
+                    "created_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "updated_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+                try:
+                    result = self.sql_connector.insert("product_galleries", gallery_data).fetch()
+                    if result:
+                        synced_count += 1
+                        print(f"    ✅ Gallery image_{i} stored: {gallery_image_url}")
+                    else:
+                        print(f"    ⚠️  Failed to insert gallery image_{i}")
+                        # If we've synced some images but this one failed, 
+                        # it might mean there are no more images
+                        if synced_count > 0 and i > synced_count + 2:
+                            print(f"    ℹ️  Stopping - likely no more gallery images after {synced_count}")
+                            break
+                except Exception as e:
+                    # Might be duplicate or no more images, skip
+                    print(f"    ⚠️  Could not insert image_{i}: {str(e)}")
+                    # If we've already found some images and get errors, 
+                    # it probably means no more images exist
+                    if synced_count > 0 and "Duplicate" not in str(e):
+                        print(f"    ℹ️  Stopping - likely no more gallery images")
+                        break
+                    continue
+            
+            print(f"\n📊 Gallery sync summary:")
+            print(f"  - Main cover image: image_1920 ✅")
+            print(f"  - Gallery images synced: {synced_count} (image_1 to image_{synced_count})")
+            print(f"🎉 Total: 1 main image + {synced_count} gallery images")
+            
             return synced_count
             
         except Exception as e:
             print(f"❌ Gallery sync failed for product {product_template_id}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return 0
 
     def upsert_product_variant(self, v, attrs, product_id, tax_info, template_id=None):
@@ -186,19 +207,8 @@ class ProductHelper:
         if v.get('image_1920'):
             # Use template_id if provided, otherwise fall back to variant id
             image_id = template_id if template_id else v['id']
-            variant_image_url = f"https://odoo.eboutiques.com/public/product_image/{image_id}/image_1920"
-            print(f"🔗 Using variant image URL: {variant_image_url} (ID: {image_id})")
-            
-            try:
-                import requests
-                response = requests.head(variant_image_url, timeout=5)
-                if response.status_code == 200:
-                    variant_image = variant_image_url  # Store URL directly
-                    print("✅ Variant image URL is valid")
-                else:
-                    print("⚠️  Variant image URL not available")
-            except Exception as e:
-                print(f"⚠️  Failed to check variant image URL: {str(e)}")
+            variant_image = f"https://odoo.eboutiques.com/public/product_image/{image_id}/image_1920"
+            print(f"🔗 Using variant image URL: {variant_image}")
 
         # Prepare variant data
         variant_data = {
@@ -282,27 +292,8 @@ class ProductHelper:
             product_tax_amount = 0
 
         # Handle product image - use Odoo public URL directly
-        product_image = "no_product_image.jpg"
-        if p.get('downloaded_image_path'):
-            # Use pre-downloaded image path first
-            product_image = p['downloaded_image_path']
-        else:
-            # Use Odoo public URL directly - no downloading needed
-            main_image_url = f"https://odoo.eboutiques.com/public/product_image/{p['id']}/image_1920"
-            print(f"🔗 Using Odoo main image URL: {main_image_url}")
-            
-            try:
-                import requests
-                response = requests.head(main_image_url, timeout=5)
-                if response.status_code == 200:
-                    print("✅ Main image URL is valid")
-                    product_image = main_image_url  # Store URL directly
-                else:
-                    print("⚠️  Main image URL not available, using fallback")
-                    product_image = "no_product_image.jpg"
-            except Exception as e:
-                print(f"⚠️  Failed to check main image URL: {str(e)}")
-                product_image = "no_product_image.jpg"
+        product_image = f"https://odoo.eboutiques.com/public/product_image/{p['id']}/image_1920"
+        print(f"🔗 Using Odoo main image URL: {product_image}")
 
         # Generate unique slug
         slug_base = slugify(p["name"])

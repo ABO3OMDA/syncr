@@ -193,14 +193,14 @@ def sync_product_updates(connector, sql_connector, helper, limit=50):
         traceback.print_exc()
 
 def quick_quantity_sync(connector, sql_connector, limit=50):
-    """Quick sync for quantity changes only"""
+    """Quick sync for quantity changes only - FIXED with commit"""
     print(f"\n🔢 Quick quantity sync...")
     
     try:
         # Get recently synced products with potential quantity changes
         synced_products = sql_connector.getAll(
             "products", 
-            "remote_key_id IS NOT NULL", 
+            "`remote_key_id` IS NOT NULL AND `remote_key_id` != ''", 
             select="id, remote_key_id, name, qty"
         ).fetch()
         
@@ -210,13 +210,13 @@ def quick_quantity_sync(connector, sql_connector, limit=50):
         
         print(f"📊 Found {len(synced_products)} synced products")
         
-        # Limit to first 20 for performance
-        synced_products = synced_products[:20]
+        # Limit to first batch for performance
+        synced_products = synced_products[:limit]
         odoo_ids = [int(p['remote_key_id']) for p in synced_products]
         
         print(f"🔍 Checking quantities for products: {odoo_ids}")
         
-        # Get current Odoo quantities (using qty_available - will check other fields later)
+        # Get current Odoo quantities
         odoo_products = connector.read('product.template', odoo_ids, ['id', 'qty_available'])
         
         print(f"📊 Got {len(odoo_products)} products from Odoo")
@@ -235,19 +235,73 @@ def quick_quantity_sync(connector, sql_connector, limit=50):
                 print(f"  🔍 {laravel_product['name']}: Laravel={laravel_qty}, Odoo={odoo_qty}")
                 
                 if odoo_qty != laravel_qty:
-                    sql_connector.update("products", f"`id` = '{laravel_product['id']}'", {"qty": odoo_qty})
-                    print(f"    🔄 UPDATED: {laravel_qty} → {odoo_qty}")
-                    updated_count += 1
+                    # Update the main product quantity
+                    update_result = sql_connector.update(
+                        "products", 
+                        f"`id` = '{laravel_product['id']}'", 
+                        {"qty": odoo_qty}
+                    )
+                    
+                    # Force fetch to ensure update was successful
+                    updated_product = sql_connector.getOne(
+                        "products",
+                        f"`id` = '{laravel_product['id']}'",
+                        select="qty"
+                    ).fetch()
+                    
+                    if updated_product and int(updated_product['qty']) == odoo_qty:
+                        print(f"    🔄 UPDATED: {laravel_qty} → {odoo_qty} ✅")
+                        
+                        # Also update variant quantities
+                        variant_ids = connector.search(
+                            'product.product', 
+                            [('product_tmpl_id', '=', odoo_product['id'])]
+                        )
+                        
+                        if variant_ids:
+                            odoo_variants = connector.read(
+                                'product.product', 
+                                variant_ids, 
+                                ['id', 'qty_available']
+                            )
+                            
+                            for odoo_variant in odoo_variants:
+                                # Update Laravel variant
+                                variant_update = sql_connector.update(
+                                    "product_variants",
+                                    f"`product_id` = '{laravel_product['id']}' AND `remote_key_id` = '{odoo_variant['id']}'",
+                                    {"stock": odoo_variant['qty_available']}
+                                )
+                                
+                                # Also update the qty field in variants table if it exists
+                                sql_connector.update(
+                                    "product_variants",
+                                    f"`product_id` = '{laravel_product['id']}' AND `remote_key_id` = '{odoo_variant['id']}'",
+                                    {"qty": odoo_variant['qty_available']}
+                                )
+                        
+                        updated_count += 1
+                    else:
+                        print(f"    ❌ Update failed - qty still shows as {updated_product.get('qty') if updated_product else 'unknown'}")
                 else:
                     print(f"    ✅ No change needed")
         
         print(f"✅ Checked {checked_count} products, updated {updated_count} quantities")
         
+        # Close any open connections to ensure commits
+        try:
+            if hasattr(sql_connector, '_pool'):
+                sql_connector._pool.close_all()
+        except:
+            pass
+        
     except Exception as e:
         print(f"❌ Quick quantity sync failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 def quick_image_sync(connector, sql_connector, helper, limit=30):
-    """Quick sync for image changes"""
+    """Quick sync for image changes - Simplified"""
     print(f"\n🖼️  Quick image sync...")
     
     try:
@@ -275,22 +329,12 @@ def quick_image_sync(connector, sql_connector, helper, limit=30):
                 if not laravel_product:
                     continue
                 
-                # Check main image
-                if product.get('image_1920'):
-                    new_url = f"https://odoo.eboutiques.com/public/product_image/{product['id']}/image_1920"
-                    current_url = laravel_product.get('thumb_image', '')
-                    
-                    if new_url != current_url:
-                        # Quick URL validation
-                        import requests
-                        try:
-                            response = requests.head(new_url, timeout=3)
-                            if response.status_code == 200:
-                                sql_connector.update("products", f"`id` = '{laravel_product['id']}'", {"thumb_image": new_url})
-                                print(f"  🔄 Updated image: {product['name']}")
-                                updated_count += 1
-                        except:
-                            pass  # Skip if URL check fails
+                # Update main image URL directly
+                new_url = f"https://odoo.eboutiques.com/public/product_image/{product['id']}/image_1920"
+                
+                sql_connector.update("products", f"`id` = '{laravel_product['id']}'", {"thumb_image": new_url})
+                print(f"  🔄 Updated image URL: {product['name']}")
+                updated_count += 1
                 
                 # Quick gallery resync
                 helper.sync_product_gallery(product['id'], laravel_product['id'])
